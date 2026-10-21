@@ -18,6 +18,8 @@ bool MAX30102Driver::begin() {
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK_SPEED);
 
     if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.printf("[MAX30102] Gagal menemukan sensor pada SDA=%d, SCL=%d! Periksa wiring & VCC (3.3V).\n",
+                      I2C_SDA_PIN, I2C_SCL_PIN);
         connected = false;
         return false;
     }
@@ -71,8 +73,8 @@ bool MAX30102Driver::setSampleRate(uint16_t sampleRate, uint8_t sampleAverage) {
     lp_red = 0.0f;
 
     connected = true;
-    Serial.printf("# [MAX30102] Set Rate: %d Hz (Avg: %dx)\n",
-                  currentSampleRate, currentSampleAverage);
+    Serial.printf("[MAX30102] Set Rate: %d Hz (Avg: %dx, AlphaLP: %.3f)\n",
+                  currentSampleRate, currentSampleAverage, alpha_lp);
     return true;
 }
 
