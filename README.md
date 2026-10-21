@@ -1,17 +1,18 @@
-# Cardiovascular Health Multi Parameter Monitoring Based on PPG
+# ESP32 Biosignal Health Monitoring System (AD8232 ECG + MAX30102 PPG)
 
-Sistem akuisisi data sinyal *Photoplethysmogram* (PPG) berbasis **ESP32** dan sensor optik **MAX30102** dengan arsitektur **FreeRTOS Dual-Core**, pengiriman data stream ke **Raspberry Pi 5** via UART, serta visualisasi sinyal real-time melalui **Web Application (WebSocket)**.
+Sistem akuisisi data biosinyal multimodal (*Electrocardiogram* / ECG & *Photoplethysmogram* / PPG) deterministik berbasis **ESP32-S3**, sensor optik **MAX30102**, dan sensor elektrokardiogram **AD8232** dengan arsitektur **FreeRTOS Dual-Core + Hardware Timer**, pengiriman data stream ke **Raspberry Pi 5** via UART, serta visualisasi sinyal real-time multi-waveform melalui **Web Application (WebSocket)**.
 
 ---
 
-## 1. Arsitektur Dual-Core (FreeRTOS)
+## 1. Arsitektur Dual-Core (FreeRTOS) & Hardware Timer
 
-ESP32 memiliki prosesor 2 inti (Core 0 dan Core 1). Pada firmware ini, tugas dipisahkan secara terisolasi untuk menjamin kestabilan sampling sensor:
+ESP32-S3 memiliki prosesor 2 inti (Core 0 dan Core 1). Pada firmware ini, tugas dipisahkan secara terisolasi untuk menjamin kestabilan sampling sensor bebas jitter:
 
-| Core | Task | Prioritas | Tanggung Jawab |
-| :--- | :--- | :--- | :--- |
-| **Core 1** | `SensorTask` | High (Priority 2) | Membaca I2C FIFO MAX30102 (100 Hz), filter DC removal, deteksi jari, dan push data ke FreeRTOS Queue. |
-| **Core 0** | `CommTask` | Normal (Priority 1) | Mengambil data dari Queue, mengirim stream via UART (Serial2) ke Raspberry Pi 5, serta broadcast via WebSocket ke Web Dashboard. |
+| Core / Timer | Task / Modul | Frekuensi | Prioritas | Tanggung Jawab |
+| :--- | :--- | :--- | :--- | :--- |
+| **Core 1** | `SensorTask` | 100 Hz | High (Priority 2) | Membaca I2C FIFO MAX30102, filter DC removal, deteksi jari, dan push data PPG ke Queue. |
+| **Hardware Timer** | `esp_timer` | **500 Hz** | Timer Task | Sampling deterministik AD8232 (GPIO 5), pembacaan leads-off LO+/LO-, dan push data ECG ke Queue. |
+| **Core 0** | `CommTask` | Loop (~25 FPS) | Normal (Priority 1) | Mengambil data dari Queue, mengirim stream PPG via UART (Serial2) ke Raspberry Pi 5, serta broadcast batched ECG & PPG via WebSocket ke Web Dashboard. |
 
 ---
 
@@ -30,11 +31,23 @@ ESP32 memiliki prosesor 2 inti (Core 0 dan Core 1). Pada firmware ini, tugas dip
 
 ---
 
-### B. ESP32-S3 ke Raspberry Pi 5 (UART)
+### B. ESP32-S3 ke Sensor AD8232 (ECG)
+
+| Pin Sensor AD8232 | Pin ESP32-S3 | Keterangan |
+| :--- | :--- | :--- |
+| **3.3V / VCC** | **3.3V** | Tegangan operasional (3.3V) |
+| **GND** | **GND** | Ground bersama |
+| **OUTPUT** | **GPIO 5** | Analog Output ECG (`ADC1_CH4`, sampling 500 Hz) |
+| **LO-** | **GPIO 12** | Leads-Off Detection Minus (Digital Input) |
+| **LO+** | **GPIO 11** | Leads-Off Detection Plus (Digital Input) |
+
+---
+
+### C. ESP32-S3 ke Raspberry Pi 5 (UART)
 
 | Pin ESP32-S3 | Pin Raspberry Pi 5 | Keterangan |
 | :--- | :--- | :--- |
-| **GPIO 17 (TX2)** | **Pin 10 (GPIO 15 / UART0_RXD)** | ESP32-S3 mengirim data ke RPi 5 |
+| **GPIO 17 (TX2)** | **Pin 10 (GPIO 15 / UART0_RXD)** | ESP32-S3 mengirim stream PPG ke RPi 5 |
 | **GPIO 16 (RX2)** | **Pin 8 (GPIO 14 / UART0_TXD)** | *(Opsional)* RPi 5 mengirim perintah balik |
 | **GND** | **Pin 6 / 9 / 14 (GND)** | **Wajib dihubungkan (Common Ground)** |
 
