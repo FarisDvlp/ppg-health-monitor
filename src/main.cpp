@@ -1,64 +1,91 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_timer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 
 #include "config.h"
 #include "max30102_driver.h"
-#include "ad8232_driver.h"
+#include "web_assets.h"
 
 // FreeRTOS Handles
-QueueHandle_t sampleQueue = NULL;
+QueueHandle_t ppgQueue;
 TaskHandle_t sensorTaskHandle = NULL;
 TaskHandle_t commTaskHandle = NULL;
-esp_timer_handle_t ecgTimerHandle = NULL;
 
-// Shared PPG State (diperbarui oleh Core 1, dibaca oleh Timer 500 Hz)
-volatile uint32_t latestPpgIr = 0;
-volatile uint32_t latestPpgRed = 0;
-volatile uint8_t latestFingerStatus = 0;
+// Web Server & WebSocket Instances
+AsyncWebServer server(HTTP_SERVER_PORT);
+AsyncWebSocket ws(WS_SERVER_PATH);
 
-// Konfigurasi dinamis MAX30102 yang dapat diubah via Serial dari aplikasi Python
+// Hardware Serial untuk Raspberry Pi 5
+HardwareSerial SerialRPi(RPI_UART_NUM);
+
+// Konfigurasi dinamis yang dapat diubah dari Web
 volatile uint16_t activeSampleRate = MAX30102_DEFAULT_SRATE;
 volatile uint8_t activeSampleAvg = MAX30102_DEFAULT_AVG;
 volatile bool configNeedsUpdate = false;
 
 // ============================================================
-// CALLBACK HARDWARE TIMER 500 HZ (SETIAP 2000 US)
+// WEBSOCKET EVENT HANDLER
 // ============================================================
-static void ecgTimerCallback(void* arg) {
-    ECGPacket ecgPkt;
-    if (ecgSensor.sample(ecgPkt)) {
-        CombinedSamplePacket combined;
-        combined.timestamp_ms = ecgPkt.timestamp_ms;
-        combined.ecg_raw = ecgPkt.raw_adc;
-        combined.lo_status = (ecgPkt.lo_plus ? 1 : 0) | (ecgPkt.lo_minus ? 2 : 0);
-        combined.ppg_ir = latestPpgIr;
-        combined.ppg_red = latestPpgRed;
-        combined.finger_status = latestFingerStatus;
-
-        xQueueSend(sampleQueue, &combined, 0);
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    switch (type) {
+        case WS_EVT_CONNECT:
+            Serial.printf("[WebSocket] Client connected: #%u from %s\n", client->id(), client->remoteIP().toString().c_str());
+            break;
+        case WS_EVT_DISCONNECT:
+            Serial.printf("[WebSocket] Client disconnected: #%u\n", client->id());
+            break;
+        case WS_EVT_DATA: {
+            AwsFrameInfo *info = (AwsFrameInfo*)arg;
+            if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+                JsonDocument doc;
+                DeserializationError err = deserializeJson(doc, data, len);
+                if (!err) {
+                    const char* cmd = doc["cmd"] | "";
+                    if (strcmp(cmd, "set_rate") == 0) {
+                        uint16_t newRate = doc["rate"] | 100;
+                        uint8_t newAvg = doc["avg"] | 1;
+                        activeSampleRate = newRate;
+                        activeSampleAvg = newAvg;
+                        configNeedsUpdate = true;
+                        Serial.printf("[Web Command] Set Rate requested: %d Hz (Avg: %dx)\n", newRate, newAvg);
+                    }
+                }
+            }
+            break;
+        }
+        case WS_EVT_PONG:
+        case WS_EVT_ERROR:
+            break;
     }
 }
 
 // ============================================================
-// CORE 1: MAX30102 I2C SENSOR TASK
+// CORE 1: SENSOR TASK (HIGH PRIORITY)
 // ============================================================
 void vTaskSensorLoop(void *pvParameters) {
-    ppgSensor.begin();
+    Serial.printf("[Core 1] Sensor Task berjalan pada Core %d\n", xPortGetCoreID());
 
-    PPGPacket ppgSample;
+    if (!ppgSensor.begin()) {
+        Serial.println("[Core 1] Sensor MAX30102 belum terdeteksi. Mencoba ulang...");
+    }
+
+    PPGPacket sample;
 
     for (;;) {
+        // Update konfigurasi sensor jika ada request dari web
         if (configNeedsUpdate) {
             configNeedsUpdate = false;
             ppgSensor.setSampleRate(activeSampleRate, activeSampleAvg);
+            Serial.printf("[Core 1] Sensor berhasil diubah ke %d Hz\n", activeSampleRate);
         }
 
-        // Kuras seluruh sampel baru di FIFO MAX30102
-        while (ppgSensor.readSample(ppgSample)) {
-            latestPpgIr = ppgSample.raw_ir;
-            latestPpgRed = ppgSample.raw_red;
-            latestFingerStatus = ppgSample.finger_present ? 1 : 0;
+        // Kuras SEMUA data yang ada di FIFO sensor seketika
+        while (ppgSensor.readSample(sample)) {
+            if (xQueueSend(ppgQueue, &sample, 0) != pdPASS) {
+                // Drop jika queue penuh
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -66,107 +93,160 @@ void vTaskSensorLoop(void *pvParameters) {
 }
 
 // ============================================================
-// CORE 0: USB SERIAL STREAMING & COMMAND HANDLER TASK
+// CORE 0: COMMUNICATION & WEB SERVER TASK
 // ============================================================
 void vTaskCommLoop(void *pvParameters) {
-    CombinedSamplePacket pkt;
-    char txBuf[512];
-    int txLen = 0;
-    String cmdBuffer = "";
+    Serial.printf("[Core 0] Communication Task berjalan pada Core %d\n", xPortGetCoreID());
+
+    // 1. Inisialisasi UART2 untuk Raspberry Pi 5
+    SerialRPi.begin(RPI_UART_BAUD, SERIAL_8N1, RPI_UART_RX_PIN, RPI_UART_TX_PIN);
+    Serial.printf("[UART] Serial2 aktif: TX=GPIO%d, RX=GPIO%d @ %d bps\n", 
+                  RPI_UART_TX_PIN, RPI_UART_RX_PIN, RPI_UART_BAUD);
+
+    // 2. Inisialisasi Wi-Fi Access Point
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false); // MATIKAN POWER SAVE WIFI AGAR KONEKSI STABIL 100% TANPA PUTUS
+    WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL, 0, WIFI_AP_MAX_CONN);
+
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[WiFi] Access Point Aktif!\n");
+    Serial.printf("       SSID : %s\n", WIFI_AP_SSID);
+    Serial.printf("       IP   : %s\n", apIP.toString().c_str());
+
+    // 3. Konfigurasi HTTP Web Server & WebSocket
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
+    // Route halaman utama (Web UI)
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", INDEX_HTML);
+    });
+
+    // Endpoint status device (JSON API)
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        doc["device"] = "ESP32-S3-PPG-Monitor";
+        doc["sensor_connected"] = ppgSensor.isConnected();
+        doc["sample_rate"] = ppgSensor.getSampleRate();
+        doc["sample_avg"] = ppgSensor.getSampleAverage();
+        doc["free_heap"] = ESP.getFreeHeap();
+        doc["uptime_s"] = millis() / 1000;
+        doc["ws_clients"] = ws.count();
+
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+    });
+
+    // Endpoint set sample rate via HTTP: /api/set_rate?rate=100&avg=1
+    server.on("/api/set_rate", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("rate")) {
+            uint16_t r = request->getParam("rate")->value().toInt();
+            uint8_t a = request->hasParam("avg") ? request->getParam("avg")->value().toInt() : 1;
+            if (r >= 50 && r <= 800) {
+                activeSampleRate = r;
+                activeSampleAvg = (a > 0) ? a : 1;
+                configNeedsUpdate = true;
+                request->send(200, "application/json", "{\"status\":\"ok\",\"rate\":" + String(r) + "}");
+                return;
+            }
+        }
+        request->send(400, "application/json", "{\"error\":\"invalid_parameters\"}");
+    });
+
+    server.begin();
+    Serial.println("[Web Server] Web dashboard aktif pada port 80.");
+
+    // Buffer batching untuk WebSocket
+    PPGPacket sample;
+    const uint8_t MAX_BATCH = 20;
+    PPGPacket batchBuffer[MAX_BATCH];
+    uint8_t batchCount = 0;
+    uint32_t lastWsSendTime = millis();
+    uint32_t lastWsCleanup = millis();
 
     for (;;) {
-        // 1. Kuras Queue dan kirim dalam blok buffer agar USB CDC maksimal (500 Hz mulus)
-        txLen = 0;
-        int count = 0;
-        while (count < 8 && xQueueReceive(sampleQueue, &pkt, 0) == pdPASS) {
-            int n = snprintf(txBuf + txLen, sizeof(txBuf) - txLen,
-                             "%lu,%u,%u,%lu,%lu,%u\n",
-                             (unsigned long)pkt.timestamp_ms,
-                             (unsigned int)pkt.ecg_raw,
-                             (unsigned int)pkt.lo_status,
-                             (unsigned long)pkt.ppg_ir,
-                             (unsigned long)pkt.ppg_red,
-                             (unsigned int)pkt.finger_status);
-            if (n > 0 && (txLen + n) < (int)sizeof(txBuf)) {
-                txLen += n;
-            }
-            count++;
-        }
+        // Ambil data dari Queue
+        if (xQueueReceive(ppgQueue, &sample, pdMS_TO_TICKS(10)) == pdPASS) {
+            
+            // -------------------------------------------------------------
+            // A. RAW DATA 100% MURNI KE RASPBERRY PI 5 VIA UART (SERIAL2)
+            // -------------------------------------------------------------
+            SerialRPi.printf("{\"t\":%lu,\"ir\":%lu,\"red\":%lu,\"f\":%d}\n",
+                             sample.timestamp_ms,
+                             sample.raw_ir,
+                             sample.raw_red,
+                             sample.finger_present ? 1 : 0);
 
-        if (txLen > 0) {
-            Serial.write((const uint8_t*)txBuf, txLen);
-        } else {
-            // Jika queue kosong, tunggu hingga 2ms untuk sampel berikutnya
-            if (xQueueReceive(sampleQueue, &pkt, pdMS_TO_TICKS(2)) == pdPASS) {
-                int n = snprintf(txBuf, sizeof(txBuf),
-                                 "%lu,%u,%u,%lu,%lu,%u\n",
-                                 (unsigned long)pkt.timestamp_ms,
-                                 (unsigned int)pkt.ecg_raw,
-                                 (unsigned int)pkt.lo_status,
-                                 (unsigned long)pkt.ppg_ir,
-                                 (unsigned long)pkt.ppg_red,
-                                 (unsigned int)pkt.finger_status);
-                if (n > 0) {
-                    Serial.write((const uint8_t*)txBuf, n);
-                }
+            // Simpan ke batch WebSocket jika ada client aktif
+            if (ws.count() > 0 && batchCount < MAX_BATCH) {
+                batchBuffer[batchCount++] = sample;
             }
         }
 
-        // 2. Cek apakah ada perintah konfigurasi dari aplikasi Python (format: "RATE:100,AVG:1\n")
-        while (Serial.available() > 0) {
-            char c = (char)Serial.read();
-            if (c == '\n' || c == '\r') {
-                cmdBuffer.trim();
-                if (cmdBuffer.startsWith("RATE:")) {
-                    int commaIdx = cmdBuffer.indexOf(',');
-                    int rateVal = 100;
-                    int avgVal = 1;
-                    if (commaIdx > 5) {
-                        rateVal = cmdBuffer.substring(5, commaIdx).toInt();
-                        int avgIdx = cmdBuffer.indexOf("AVG:");
-                        if (avgIdx > 0) {
-                            avgVal = cmdBuffer.substring(avgIdx + 4).toInt();
-                        }
-                    } else {
-                        rateVal = cmdBuffer.substring(5).toInt();
-                    }
-                    if (rateVal >= 50 && rateVal <= 800) {
-                        activeSampleRate = (uint16_t)rateVal;
-                        activeSampleAvg = (uint8_t)((avgVal > 0) ? avgVal : 1);
-                        configNeedsUpdate = true;
+        // -------------------------------------------------------------
+        // B. BROADCAST KE WEBSOCKET DENGAN INTERVAL STABIL (~40ms / 25 FPS)
+        // -------------------------------------------------------------
+        uint32_t now = millis();
+        if (now - lastWsSendTime >= 40) {
+            lastWsSendTime = now;
+
+            if (ws.count() > 0 && batchCount > 0) {
+                JsonDocument doc;
+                doc["r"] = (int)activeSampleRate;
+                JsonArray dataArr = doc["d"].to<JsonArray>();
+
+                for (uint8_t i = 0; i < batchCount; i++) {
+                    JsonArray item = dataArr.add<JsonArray>();
+                    item.add(batchBuffer[i].timestamp_ms);
+                    item.add(batchBuffer[i].raw_ir);
+                    item.add(batchBuffer[i].raw_red);
+                    item.add(round(batchBuffer[i].smooth_ac_ir * 10.0f) / 10.0f);
+                    item.add(round(batchBuffer[i].smooth_ac_red * 10.0f) / 10.0f);
+                    item.add(batchBuffer[i].finger_present ? 1 : 0);
+                }
+
+                String jsonString;
+                serializeJson(doc, jsonString);
+
+                // Kirim secara aman ke client tanpa memicu buffer congestion
+                for (AsyncWebSocketClient &c : ws.getClients()) {
+                    if (c.status() == WS_CONNECTED && !c.queueIsFull()) {
+                        c.text(jsonString);
                     }
                 }
-                cmdBuffer = "";
-            } else if (cmdBuffer.length() < 64) {
-                cmdBuffer += c;
+
+                batchCount = 0;
             }
+        }
+
+        // Cleanup client tidak aktif setiap 10 detik
+        if (now - lastWsCleanup > 10000) {
+            lastWsCleanup = now;
+            ws.cleanupClients();
         }
     }
 }
 
 // ============================================================
-// MAIN SETUP & LOOP
+// MAIN SETUP & ARDUINO LOOP
 // ============================================================
 void setup() {
-    // 1. Matikan total Radio Wi-Fi & Bluetooth untuk mengeliminasi noise RF pada ADC & beban CPU
-    WiFi.mode(WIFI_OFF);
-    btStop();
-
-    // 2. Inisialisasi High-Speed USB Serial (921600 bps)
     Serial.begin(DEBUG_SERIAL_BAUD);
-    Serial.setTxBufferSize(2048);
-    delay(500);
+    delay(1000);
 
-    // 3. Buat FreeRTOS Queue untuk stream 500 Hz
-    sampleQueue = xQueueCreate(COMBINED_QUEUE_SIZE, sizeof(CombinedSamplePacket));
-    if (sampleQueue == NULL) {
+    Serial.println("\n==================================================");
+    Serial.println("  ESP32-S3 PPG HEALTH MONITOR - MAX30102         ");
+    Serial.println("==================================================");
+
+    // Inisialisasi FreeRTOS Queue
+    ppgQueue = xQueueCreate(PPG_QUEUE_SIZE, sizeof(PPGPacket));
+    if (ppgQueue == NULL) {
+        Serial.println("[Error] Gagal mengalokasikan FreeRTOS PPG Queue!");
         while (1) { delay(1000); }
     }
 
-    // 4. Inisialisasi Hardware Sensor AD8232 (ECG)
-    ecgSensor.begin();
-
-    // 5. Jalankan Task Pembacaan MAX30102 pada Core 1
+    // 1. Task Sensor pada Core 1
     xTaskCreatePinnedToCore(
         vTaskSensorLoop,
         "SensorTask",
@@ -177,7 +257,7 @@ void setup() {
         TASK_SENSOR_CORE
     );
 
-    // 6. Jalankan Task Pengiriman Serial pada Core 0
+    // 2. Task Komunikasi & Web pada Core 0
     xTaskCreatePinnedToCore(
         vTaskCommLoop,
         "CommTask",
@@ -188,17 +268,7 @@ void setup() {
         TASK_COMM_CORE
     );
 
-    // 7. Mulai Hardware Timer 500 Hz (2000 us) untuk AD8232 + Sinkronisasi Paket
-    const esp_timer_create_args_t ecgTimerArgs = {
-        .callback = &ecgTimerCallback,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "ad8232_500hz",
-        .skip_unhandled_events = true
-    };
-    if (esp_timer_create(&ecgTimerArgs, &ecgTimerHandle) == ESP_OK) {
-        esp_timer_start_periodic(ecgTimerHandle, AD8232_INTERVAL_US);
-    }
+    Serial.println("[System] FreeRTOS Dual-Core Tasks siap.");
 }
 
 void loop() {

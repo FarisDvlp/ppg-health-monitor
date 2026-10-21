@@ -17,8 +17,18 @@
 #define RPI_UART_RX_PIN         16      // ESP32 RX2 <- RPi 5 TX (GPIO 14 / UART0_TXD)
 #define RPI_UART_BAUD           115200  // Baudrate ke Raspberry Pi 5
 
-// USB Serial ke PC / Laptop (High-Speed 921600 bps)
-#define DEBUG_SERIAL_BAUD       921600
+// Debug Serial (USB Serial0)
+#define DEBUG_SERIAL_BAUD       115200
+
+// ==========================================
+// WIFI ACCESS POINT CONFIGURATION
+// ==========================================
+#define WIFI_AP_SSID            "ESP32_PPG_MONITOR"
+#define WIFI_AP_PASSWORD        "12345678"
+#define WIFI_AP_CHANNEL         1
+#define WIFI_AP_MAX_CONN        4
+#define HTTP_SERVER_PORT        80
+#define WS_SERVER_PATH          "/ws"
 
 // ==========================================
 // SENSOR MAX30102 CONFIGURATION
@@ -43,56 +53,27 @@
 // ==========================================
 // FREERTOS DUAL-CORE CONFIGURATION
 // ==========================================
-#define TASK_SENSOR_CORE        1       // Core 1: Khusus pembacaan sensor I2C MAX30102
-#define TASK_COMM_CORE          0       // Core 0: Khusus pengiriman stream Serial ke PC
+#define TASK_SENSOR_CORE        1       // Core 1: Khusus pembacaan sensor I2C
+#define TASK_COMM_CORE          0       // Core 0: Khusus WiFi, WebServer, WebSocket, dan UART
 
 #define TASK_SENSOR_PRIORITY    2       // High Priority
-#define TASK_COMM_PRIORITY      2       // High Priority
+#define TASK_COMM_PRIORITY      1       // Normal Priority
 
 #define SENSOR_TASK_STACK_SIZE  4096
-#define COMM_TASK_STACK_SIZE    4096
+#define COMM_TASK_STACK_SIZE    8192
 
-#define COMBINED_QUEUE_SIZE     1024    // Buffer 1024 sampel (~2 detik pada 500 Hz)
+#define PPG_QUEUE_SIZE          256     // Buffer besar hingga 256 sampel
 
-// ==========================================
-// SENSOR AD8232 (ECG) CONFIGURATION
-// ==========================================
-#define AD8232_OUTPUT_PIN       5       // Analog Output ECG (ESP32-S3 ADC1_CH4)
-#define AD8232_LO_MINUS_PIN     12      // Leads-Off Detect - (Digital Input)
-#define AD8232_LO_PLUS_PIN      11      // Leads-Off Detect + (Digital Input)
-
-#define AD8232_SAMPLE_RATE      500     // 500 Hz ECG Sampling
-#define AD8232_INTERVAL_US      2000    // 2000 us = 500 Hz
-
-// Struktur data paket ECG
-struct ECGPacket {
-    uint32_t timestamp_ms;
-    uint16_t raw_adc;       // RAW ADC 12-bit (0 - 4095)
-    bool leads_off;         // true jika LO+ atau LO- terdeteksi lepas
-    bool lo_plus;           // Status pin LO+
-    bool lo_minus;          // Status pin LO-
-};
-
-// Struktur data paket PPG
+// Struktur data paket PPG yang ditransfer antar core & dikirim ke RPi 5
 struct PPGPacket {
     uint32_t timestamp_ms;
-    uint32_t raw_ir;
-    uint32_t raw_red;
+    uint32_t raw_ir;        // RAW MURNI untuk UART RPi 5
+    uint32_t raw_red;       // RAW MURNI untuk UART RPi 5
     bool finger_present;
-    float filtered_ac_ir;
+    float filtered_ac_ir;   // AC Component (DC removed)
     float filtered_ac_red;
-    float smooth_ac_ir;
-    float smooth_ac_red;
-};
-
-// Struktur data paket terpadu 500 Hz untuk dikirim via Serial ke PC
-struct CombinedSamplePacket {
-    uint32_t timestamp_ms;
-    uint16_t ecg_raw;       // 0 - 4095
-    uint8_t lo_status;      // 0 = Normal, 1 = LO+, 2 = LO-, 3 = LO+ & LO-
-    uint32_t ppg_ir;        // Raw IR MAX30102
-    uint32_t ppg_red;       // Raw RED MAX30102
-    uint8_t finger_status;  // 0 = No Finger, 1 = Finger Detected
+    float smooth_ac_ir;     // Denoised Low-Pass Filtered untuk Web Display
+    float smooth_ac_red;    // Denoised Low-Pass Filtered untuk Web Display
 };
 
 #endif // CONFIG_H
