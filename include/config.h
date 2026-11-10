@@ -6,18 +6,21 @@
 // ==========================================
 // PINOUT CONFIGURATION (ESP32-S3)
 // ==========================================
-// I2C Pins for MAX30102 Sensor
+// I2C MAX30102
 #define I2C_SDA_PIN             8
 #define I2C_SCL_PIN             9
-#define I2C_CLOCK_SPEED         400000  // 400 kHz Fast Mode
+#define I2C_CLOCK_SPEED         400000
 
-// Hardware UART2 for Raspberry Pi 5 Communication
-#define RPI_UART_NUM            2
-#define RPI_UART_TX_PIN         17      // ESP32 TX2 -> RPi 5 RX (GPIO 15 / UART0_RXD)
-#define RPI_UART_RX_PIN         16      // ESP32 RX2 <- RPi 5 TX (GPIO 14 / UART0_TXD)
-#define RPI_UART_BAUD           115200  // Baudrate ke Raspberry Pi 5
+// AD8232 ECG: pastikan pin sesuai wiring fisik yang sudah diverifikasi
+#define ECG_OUTPUT_PIN          5
+#define ECG_LO_PLUS_PIN         17
+#define ECG_LO_MINUS_PIN        18
+#define ECG_SAMPLE_RATE         500
+#define ECG_QUEUE_SIZE          1000
+#define ECG_BATCH_SIZE          25
+#define ECG_TASK_STACK_SIZE     4096
 
-// Debug Serial (USB Serial0)
+// USB Serial ke laptop
 #define DEBUG_SERIAL_BAUD       115200
 
 // ==========================================
@@ -33,47 +36,44 @@
 // ==========================================
 // SENSOR MAX30102 CONFIGURATION
 // ==========================================
-// Mode: 2 = Red + IR (SpO2 & Heart Rate Mode)
 #define MAX30102_LED_MODE       2
-// Sample Average: 1 (tanpa averaging agar rate aktual sesuai dengan sample rate)
 #define MAX30102_DEFAULT_AVG    1
-// ADC Range: 16384 (18-bit full dynamic range)
 #define MAX30102_ADC_RANGE      16384
-// Default Sample Rate: 100 Hz
 #define MAX30102_DEFAULT_SRATE  100
-// Pulse Width: 411 us (18-bit ADC resolution)
 #define MAX30102_PULSE_WIDTH    411
-// LED Brightness: 0x24 (~7.2mA)
 #define MAX30102_LED_POWER_RED  0x24
 #define MAX30102_LED_POWER_IR   0x24
-
-// Threshold raw IR value untuk deteksi jari (10,000)
-#define FINGER_DETECT_THRESHOLD 10000
+#define FINGER_DETECT_THRESHOLD 20000
 
 // ==========================================
-// FREERTOS DUAL-CORE CONFIGURATION
+// FREERTOS CONFIGURATION
 // ==========================================
-#define TASK_SENSOR_CORE        1       // Core 1: Khusus pembacaan sensor I2C
-#define TASK_COMM_CORE          0       // Core 0: Khusus WiFi, WebServer, WebSocket, dan UART
-
-#define TASK_SENSOR_PRIORITY    2       // High Priority
-#define TASK_COMM_PRIORITY      1       // Normal Priority
-
+#define TASK_SENSOR_CORE        1
+#define TASK_COMM_CORE          0
+#define TASK_SENSOR_PRIORITY    2
+#define TASK_COMM_PRIORITY      1
 #define SENSOR_TASK_STACK_SIZE  4096
 #define COMM_TASK_STACK_SIZE    8192
+#define PPG_QUEUE_SIZE          256
 
-#define PPG_QUEUE_SIZE          256     // Buffer besar hingga 256 sampel
-
-// Struktur data paket PPG yang ditransfer antar core & dikirim ke RPi 5
+// Struktur data MAX30102; dipertahankan sesuai driver yang sudah ada.
 struct PPGPacket {
     uint32_t timestamp_ms;
-    uint32_t raw_ir;        // RAW MURNI untuk UART RPi 5
-    uint32_t raw_red;       // RAW MURNI untuk UART RPi 5
+    uint32_t raw_ir;
+    uint32_t raw_red;
     bool finger_present;
-    float filtered_ac_ir;   // AC Component (DC removed)
+    float filtered_ac_ir;
     float filtered_ac_red;
-    float smooth_ac_ir;     // Denoised Low-Pass Filtered untuk Web Display
-    float smooth_ac_red;    // Denoised Low-Pass Filtered untuk Web Display
+    float smooth_ac_ir;
+    float smooth_ac_red;
+};
+
+// Satu sampel mentah AD8232. Timestamp berasal dari esp_timer_get_time().
+// lead_off bit 0 = LO+, bit 1 = LO- (1 menandakan pin HIGH / lead-off).
+struct ECGPacket {
+    uint64_t timestamp_us;
+    uint16_t raw_value;
+    uint8_t lead_off;
 };
 
 #endif // CONFIG_H

@@ -3,6 +3,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <esp_timer.h>
 
 #include "config.h"
 #include "max30102_driver.h"
@@ -10,15 +11,19 @@
 
 // FreeRTOS Handles
 QueueHandle_t ppgQueue;
+QueueHandle_t ecgQueue;
 TaskHandle_t sensorTaskHandle = NULL;
 TaskHandle_t commTaskHandle = NULL;
+TaskHandle_t ecgTaskHandle = NULL;
+esp_timer_handle_t ecgTimerHandle = nullptr;
+volatile uint32_t ecgQueueDropCount = 0;
+volatile uint32_t ecgTimerMissedCount = 0;
 
 // Web Server & WebSocket Instances
 AsyncWebServer server(HTTP_SERVER_PORT);
 AsyncWebSocket ws(WS_SERVER_PATH);
 
-// Hardware Serial untuk Raspberry Pi 5
-HardwareSerial SerialRPi(RPI_UART_NUM);
+// UART2 untuk Raspberry Pi dinonaktifkan sementara; GPIO17 dipakai LO+ AD8232.
 
 // Konfigurasi dinamis yang dapat diubah dari Web
 volatile uint16_t activeSampleRate = MAX30102_DEFAULT_SRATE;
@@ -31,10 +36,10 @@ volatile bool configNeedsUpdate = false;
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
     switch (type) {
         case WS_EVT_CONNECT:
-            Serial.printf("[WebSocket] Client connected: #%u from %s\n", client->id(), client->remoteIP().toString().c_str());
+            // Tidak menulis log ke USB Serial saat akuisisi berlangsung agar baris data tidak terganggu.
             break;
         case WS_EVT_DISCONNECT:
-            Serial.printf("[WebSocket] Client disconnected: #%u\n", client->id());
+            // Tidak menulis log ke USB Serial saat akuisisi berlangsung agar baris data tidak terganggu.
             break;
         case WS_EVT_DATA: {
             AwsFrameInfo *info = (AwsFrameInfo*)arg;
@@ -46,10 +51,12 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                     if (strcmp(cmd, "set_rate") == 0) {
                         uint16_t newRate = doc["rate"] | 100;
                         uint8_t newAvg = doc["avg"] | 1;
-                        activeSampleRate = newRate;
-                        activeSampleAvg = newAvg;
-                        configNeedsUpdate = true;
-                        Serial.printf("[Web Command] Set Rate requested: %d Hz (Avg: %dx)\n", newRate, newAvg);
+                        if (newRate >= 50 && newRate <= 100) {
+                            activeSampleRate = newRate;
+                            activeSampleAvg = (newAvg > 0) ? newAvg : 1;
+                            configNeedsUpdate = true;
+                            // Log runtime dinonaktifkan agar stream PPG/ECG tidak tercampur teks debug.
+                        }
                     }
                 }
             }
@@ -78,7 +85,7 @@ void vTaskSensorLoop(void *pvParameters) {
         if (configNeedsUpdate) {
             configNeedsUpdate = false;
             ppgSensor.setSampleRate(activeSampleRate, activeSampleAvg);
-            Serial.printf("[Core 1] Sensor berhasil diubah ke %d Hz\n", activeSampleRate);
+            // Jangan menulis debug ke Serial setelah stream akuisisi dimulai.
         }
 
         // Kuras SEMUA data yang ada di FIFO sensor seketika
@@ -98,12 +105,10 @@ void vTaskSensorLoop(void *pvParameters) {
 void vTaskCommLoop(void *pvParameters) {
     Serial.printf("[Core 0] Communication Task berjalan pada Core %d\n", xPortGetCoreID());
 
-    // 1. Inisialisasi UART2 untuk Raspberry Pi 5
-    SerialRPi.begin(RPI_UART_BAUD, SERIAL_8N1, RPI_UART_RX_PIN, RPI_UART_TX_PIN);
-    Serial.printf("[UART] Serial2 aktif: TX=GPIO%d, RX=GPIO%d @ %d bps\n", 
-                  RPI_UART_TX_PIN, RPI_UART_RX_PIN, RPI_UART_BAUD);
+    // UART2 sengaja tidak diinisialisasi selama pengambilan data melalui USB.
+    // GPIO17 saat ini digunakan oleh AD8232 LO+.
 
-    // 2. Inisialisasi Wi-Fi Access Point
+    // 1. Inisialisasi Wi-Fi Access Point
     WiFi.mode(WIFI_AP);
     WiFi.setSleep(false); // MATIKAN POWER SAVE WIFI AGAR KONEKSI STABIL 100% TANPA PUTUS
     WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL, 0, WIFI_AP_MAX_CONN);
@@ -132,6 +137,8 @@ void vTaskCommLoop(void *pvParameters) {
         doc["free_heap"] = ESP.getFreeHeap();
         doc["uptime_s"] = millis() / 1000;
         doc["ws_clients"] = ws.count();
+        doc["ecg_queue_drops"] = (uint32_t)ecgQueueDropCount;
+        doc["ecg_timer_missed"] = (uint32_t)ecgTimerMissedCount;
 
         String response;
         serializeJson(doc, response);
@@ -143,7 +150,7 @@ void vTaskCommLoop(void *pvParameters) {
         if (request->hasParam("rate")) {
             uint16_t r = request->getParam("rate")->value().toInt();
             uint8_t a = request->hasParam("avg") ? request->getParam("avg")->value().toInt() : 1;
-            if (r >= 50 && r <= 800) {
+            if (r >= 50 && r <= 100) {
                 activeSampleRate = r;
                 activeSampleAvg = (a > 0) ? a : 1;
                 configNeedsUpdate = true;
@@ -169,14 +176,13 @@ void vTaskCommLoop(void *pvParameters) {
         // Ambil data dari Queue
         if (xQueueReceive(ppgQueue, &sample, pdMS_TO_TICKS(10)) == pdPASS) {
             
-            // -------------------------------------------------------------
-            // A. RAW DATA 100% MURNI KE RASPBERRY PI 5 VIA UART (SERIAL2)
-            // -------------------------------------------------------------
-            SerialRPi.printf("{\"t\":%lu,\"ir\":%lu,\"red\":%lu,\"f\":%d}\n",
-                             sample.timestamp_ms,
-                             sample.raw_ir,
-                             sample.raw_red,
-                             sample.finger_present ? 1 : 0);
+            // Format ringkas untuk menghemat bandwidth serial saat ECG 500 Hz aktif.
+            // Format: P,timestamp_ms,raw_ir,raw_red,finger_present
+            Serial.printf("P,%lu,%lu,%lu,%d\n",
+                          (unsigned long)sample.timestamp_ms,
+                          (unsigned long)sample.raw_ir,
+                          (unsigned long)sample.raw_red,
+                          sample.finger_present ? 1 : 0);
 
             // Simpan ke batch WebSocket jika ada client aktif
             if (ws.count() > 0 && batchCount < MAX_BATCH) {
@@ -185,9 +191,48 @@ void vTaskCommLoop(void *pvParameters) {
         }
 
         // -------------------------------------------------------------
-        // B. BROADCAST KE WEBSOCKET DENGAN INTERVAL STABIL (~40ms / 25 FPS)
+        // Ambil sampel ECG dari queue tanpa blocking. Kirim per batch untuk
+        // mengurangi overhead serial dan mempertahankan timestamp tiap sampel.
+        // Format: E,t0_us,n,raw0,flags0,dt1,raw1,flags1,...
+        // dt adalah selang timestamp aktual dalam mikrodetik.
         // -------------------------------------------------------------
-        uint32_t now = millis();
+        static ECGPacket ecgBatch[ECG_BATCH_SIZE];
+        static uint8_t ecgBatchCount = 0;
+        static uint32_t lastEcgFlushMs = millis();
+        ECGPacket ecgSample;
+
+        while (ecgBatchCount < ECG_BATCH_SIZE &&
+               xQueueReceive(ecgQueue, &ecgSample, 0) == pdPASS) {
+            ecgBatch[ecgBatchCount++] = ecgSample;
+        }
+
+        const uint32_t now = millis();
+        if (ecgBatchCount > 0 &&
+            (ecgBatchCount >= ECG_BATCH_SIZE || (now - lastEcgFlushMs) >= 50)) {
+            Serial.printf("E,%llu,%u",
+                (unsigned long long)ecgBatch[0].timestamp_us,
+                (unsigned int)ecgBatchCount);
+
+            // Sampel pertama: raw, flags. Sampel berikutnya: delta_us, raw, flags.
+            Serial.printf(",%u,%u",
+                (unsigned int)ecgBatch[0].raw_value,
+                (unsigned int)ecgBatch[0].lead_off);
+            for (uint8_t i = 1; i < ecgBatchCount; ++i) {
+                uint64_t delta64 = ecgBatch[i].timestamp_us - ecgBatch[i - 1].timestamp_us;
+                uint32_t deltaUs = (delta64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)delta64;
+                Serial.printf(",%lu,%u,%u",
+                    (unsigned long)deltaUs,
+                    (unsigned int)ecgBatch[i].raw_value,
+                    (unsigned int)ecgBatch[i].lead_off);
+            }
+            Serial.println();
+            ecgBatchCount = 0;
+            lastEcgFlushMs = now;
+        }
+
+        // -------------------------------------------------------------
+        // BROADCAST KE WEBSOCKET DENGAN INTERVAL STABIL (~40ms / 25 FPS)
+        // -------------------------------------------------------------
         if (now - lastWsSendTime >= 40) {
             lastWsSendTime = now;
 
@@ -229,6 +274,54 @@ void vTaskCommLoop(void *pvParameters) {
 }
 
 // ============================================================
+// ECG SAMPLING TIMER + TASK
+// esp_timer memicu task tiap 1/ECG_SAMPLE_RATE detik. ADC dibaca di task,
+// bukan di callback timer, agar tidak menjalankan analogRead di context timer.
+// ============================================================
+static void ecgSampleTimerCallback(void *arg) {
+    (void)arg;
+    if (ecgTaskHandle != NULL) {
+        xTaskNotifyGive(ecgTaskHandle);
+    }
+}
+
+void vTaskEcgLoop(void *pvParameters) {
+    (void)pvParameters;
+    pinMode(ECG_OUTPUT_PIN, INPUT);
+    pinMode(ECG_LO_PLUS_PIN, INPUT);
+    pinMode(ECG_LO_MINUS_PIN, INPUT);
+    analogReadResolution(12);
+
+    Serial.printf("[ECG] Task aktif pada Core %d, target %d Hz, ADC GPIO%d\n",
+                  xPortGetCoreID(), ECG_SAMPLE_RATE, ECG_OUTPUT_PIN);
+
+    for (;;) {
+        // Jumlah notifikasi >1 menandakan task sempat tertinggal dari timer.
+        uint32_t notifications = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (notifications == 0) {
+            continue;
+        }
+        if (notifications > 1) {
+            ecgTimerMissedCount += (notifications - 1);
+        }
+
+        ECGPacket sample;
+        sample.timestamp_us = (uint64_t)esp_timer_get_time();
+        int adcValue = analogRead(ECG_OUTPUT_PIN);
+        int loPlus = digitalRead(ECG_LO_PLUS_PIN);
+        int loMinus = digitalRead(ECG_LO_MINUS_PIN);
+
+        sample.raw_value = (uint16_t)adcValue;
+        sample.lead_off = (uint8_t)((loPlus ? 0x01 : 0x00) |
+                                    (loMinus ? 0x02 : 0x00));
+
+        if (xQueueSend(ecgQueue, &sample, 0) != pdPASS) {
+            ecgQueueDropCount++;
+        }
+    }
+}
+
+// ============================================================
 // MAIN SETUP & ARDUINO LOOP
 // ============================================================
 void setup() {
@@ -246,6 +339,12 @@ void setup() {
         while (1) { delay(1000); }
     }
 
+    ecgQueue = xQueueCreate(ECG_QUEUE_SIZE, sizeof(ECGPacket));
+    if (ecgQueue == NULL) {
+        Serial.println("[Error] Gagal mengalokasikan FreeRTOS ECG Queue!");
+        while (1) { delay(1000); }
+    }
+
     // 1. Task Sensor pada Core 1
     xTaskCreatePinnedToCore(
         vTaskSensorLoop,
@@ -257,8 +356,44 @@ void setup() {
         TASK_SENSOR_CORE
     );
 
-    // 2. Task Komunikasi & Web pada Core 0
-    xTaskCreatePinnedToCore(
+    // 2. Task ECG pada Core 1. Sampling timer baru dimulai setelah handle tersedia.
+    BaseType_t ecgTaskCreated = xTaskCreatePinnedToCore(
+        vTaskEcgLoop,
+        "ECGTask",
+        ECG_TASK_STACK_SIZE,
+        NULL,
+        TASK_SENSOR_PRIORITY,
+        &ecgTaskHandle,
+        TASK_SENSOR_CORE
+    );
+    if (ecgTaskCreated != pdPASS) {
+        Serial.println("[Error] Gagal membuat ECG task!");
+        while (1) { delay(1000); }
+    }
+
+    esp_timer_create_args_t ecgTimerArgs = {};
+    ecgTimerArgs.callback = &ecgSampleTimerCallback;
+    ecgTimerArgs.arg = nullptr;
+    ecgTimerArgs.dispatch_method = ESP_TIMER_TASK;
+    ecgTimerArgs.name = "ecg_sample_timer";
+    esp_err_t timerCreateResult = esp_timer_create(&ecgTimerArgs, &ecgTimerHandle);
+    if (timerCreateResult != ESP_OK) {
+        Serial.printf("[Error] Gagal membuat ECG timer: %d\n", (int)timerCreateResult);
+        while (1) { delay(1000); }
+    }
+
+    const uint64_t ecgIntervalUs = 1000000ULL / ECG_SAMPLE_RATE;
+    esp_err_t timerStartResult = esp_timer_start_periodic(ecgTimerHandle, ecgIntervalUs);
+    if (timerStartResult != ESP_OK) {
+        Serial.printf("[Error] Gagal memulai ECG timer: %d\n", (int)timerStartResult);
+        while (1) { delay(1000); }
+    }
+
+    // Cetak semua pesan setup sebelum task komunikasi mulai mengirim stream.
+    Serial.printf("[System] Task PPG + ECG siap. ECG target %d Hz; UART2 nonaktif.\n", ECG_SAMPLE_RATE);
+
+    // Task komunikasi dibuat terakhir agar log setup tidak menyela baris data serial.
+    BaseType_t commTaskCreated = xTaskCreatePinnedToCore(
         vTaskCommLoop,
         "CommTask",
         COMM_TASK_STACK_SIZE,
@@ -267,8 +402,10 @@ void setup() {
         &commTaskHandle,
         TASK_COMM_CORE
     );
-
-    Serial.println("[System] FreeRTOS Dual-Core Tasks siap.");
+    if (commTaskCreated != pdPASS) {
+        Serial.println("[Error] Gagal membuat communication task!");
+        while (1) { delay(1000); }
+    }
 }
 
 void loop() {

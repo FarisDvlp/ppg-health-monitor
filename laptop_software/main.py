@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
 
 from acquisition import PPGSample, SerialReader
 from mock_acquisition import MockPPGReader
-from recording import CSVRecorder, RecordingError, SubjectInfo, SubjectInfoError
+from recording import CSVRecorder, ECGCSVRecorder, RecordingError, SubjectInfo, SubjectInfoError
 from signal_quality import SignalQualityChecker, SignalQualityResult
 from visualization import PPGWaveformWidget
 
@@ -69,6 +69,7 @@ class PPGMainWindow(QMainWindow):
         self._closing = False
 
         self.recorder = CSVRecorder(output_dir="data_ppg")
+        self.ecg_recorder = ECGCSVRecorder(output_dir="data_ecg")
         self.quality_checker = SignalQualityChecker(
             expected_sample_rate_hz=EXPECTED_SAMPLE_RATE_HZ
         )
@@ -318,7 +319,8 @@ class PPGMainWindow(QMainWindow):
             reader.stop()
             reader.join(timeout=1.0)
             # Drain samples that arrived just before the reader stopped.
-            while not reader.samples.empty():
+            ecg_queue = getattr(reader, "ecg_samples", None)
+            while (not reader.samples.empty()) or (ecg_queue is not None and not ecg_queue.empty()):
                 self._drain_samples()
 
         self.reader = None
@@ -351,30 +353,53 @@ class PPGMainWindow(QMainWindow):
                 str(self.age_input.value()),
             )
             filepath = self.recorder.start(subject)
+            ecg_filepath = None
+            if not self._simulation_mode:
+                try:
+                    ecg_filepath = self.ecg_recorder.start(subject)
+                except (RecordingError, OSError):
+                    # If the ECG file cannot be opened, roll back the PPG file
+                    # so the session does not appear to be paired when it is not.
+                    self.recorder.stop()
+                    raise
         except (SubjectInfoError, RecordingError, OSError) as exc:
             QMessageBox.warning(self, "Cannot start recording", str(exc))
             return
 
         self.start_record_button.setEnabled(False)
         self.stop_record_button.setEnabled(True)
-        self.recording_status_label.setText(f"Recording: ACTIVE — {filepath}")
+        if ecg_filepath is not None:
+            self.recording_status_label.setText(
+                f"Recording: ACTIVE — PPG: {filepath} | ECG: {ecg_filepath}"
+            )
+        else:
+            self.recording_status_label.setText(
+                f"Recording: ACTIVE — PPG only (simulation): {filepath}"
+            )
 
     def _stop_recording(self, silent: bool = False) -> None:
-        if not self.recorder.is_recording:
+        if not self.recorder.is_recording and not self.ecg_recorder.is_recording:
             self.stop_record_button.setEnabled(False)
             self.start_record_button.setEnabled(self.serial_connected)
             if not silent:
                 self.recording_status_label.setText("Recording: inactive")
             return
 
-        # Process queued samples already received before closing the CSV file.
-        while self.reader is not None and not self.reader.samples.empty():
+        # Drain both PPG and ECG queues before closing the two files.
+        while self.reader is not None:
+            ecg_queue = getattr(self.reader, "ecg_samples", None)
+            if self.reader.samples.empty() and (ecg_queue is None or ecg_queue.empty()):
+                break
             self._drain_samples()
         try:
-            filepath = self.recorder.stop()
-            self.recording_status_label.setText(
-                f"Recording: STOPPED — {filepath} | Samples saved: {self.recorder.samples_written}"
+            ppg_filepath = self.recorder.stop()
+            ecg_filepath = self.ecg_recorder.stop() if self.ecg_recorder.is_recording else None
+            message = (
+                f"Recording: STOPPED — PPG: {ppg_filepath} ({self.recorder.samples_written} samples)"
             )
+            if ecg_filepath is not None:
+                message += f" | ECG: {ecg_filepath} ({self.ecg_recorder.samples_written} samples)"
+            self.recording_status_label.setText(message)
         except RecordingError as exc:
             self.recording_status_label.setText(f"Recording error: {exc}")
             if not silent:
@@ -424,7 +449,7 @@ class PPGMainWindow(QMainWindow):
         elif event_type == "error":
             self.serial_connected = False
             self._set_connection_status(message, "error")
-            if self.recorder.is_recording:
+            if self.recorder.is_recording or self.ecg_recorder.is_recording:
                 self._stop_recording(silent=True)
             self.connect_button.setEnabled(True)
             self.disconnect_button.setEnabled(False)
@@ -467,6 +492,11 @@ class PPGMainWindow(QMainWindow):
                         self.recording_status_label.setText(
                             f"Recording close error: {stop_exc}"
                         )
+                    try:
+                        if self.ecg_recorder.is_recording:
+                            self.ecg_recorder.stop()
+                    except RecordingError:
+                        pass
                     else:
                         self.recording_status_label.setText(
                             f"Recording stopped after a write error: {exc}"
@@ -481,6 +511,27 @@ class PPGMainWindow(QMainWindow):
             self.waveform_widget.add_samples(batch)
             if self.latest_sample is not None:
                 self._render_quality_result(self.quality_checker.latest_result)
+
+        # Drain ECG independently from PPG because its sampling rate is higher.
+        ecg_queue = getattr(reader, "ecg_samples", None)
+        if ecg_queue is not None:
+            for _ in range(MAX_SAMPLES_PER_GUI_TICK):
+                try:
+                    ecg_sample = ecg_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if self.ecg_recorder.is_recording:
+                    try:
+                        self.ecg_recorder.write_sample(ecg_sample)
+                    except RecordingError as exc:
+                        self._set_connection_status(f"ECG CSV recording error: {exc}", "error")
+                        try:
+                            self.ecg_recorder.stop()
+                        except RecordingError:
+                            pass
+                        self.recording_status_label.setText(
+                            f"ECG recording stopped after a write error: {exc}"
+                        )
 
     # ------------------------------------------------------------------
     # Status presentation
@@ -498,7 +549,9 @@ class PPGMainWindow(QMainWindow):
             f"Processed by app: {self.total_samples_processed} | "
             f"Invalid JSON/data lines: {stats['invalid_lines']} | "
             f"Ignored debug/blank lines: {stats['ignored_lines']} | "
-            f"Queue drops: {stats['samples_dropped_queue_full']}"
+            f"PPG queue drops: {stats['samples_dropped_queue_full']} | "
+            f"ECG received: {stats.get('valid_ecg_samples', 0)} | "
+            f"ECG queue drops: {stats.get('ecg_samples_dropped_queue_full', 0)}"
         )
 
         # Be explicit when a USB serial connection is open but only debug text
@@ -512,9 +565,9 @@ class PPGMainWindow(QMainWindow):
             import time
             if time.monotonic() - self._connection_started_at >= 5.0:
                 self._set_connection_status(
-                    "Serial port is open, but no valid PPG JSON has arrived yet. "
-                    "Check that this port actually outputs lines with t, ir, red, and f; "
-                    "the ESP32 USB port may be outputting debug logs only.",
+                    "Serial port is open, but no valid PPG samples have arrived yet. "
+                    "The firmware should output P,timestamp_ms,IR,RED,finger or legacy JSON lines; "
+                    "check the selected USB port and firmware output.",
                     "warning",
                 )
                 self._no_ppg_warning_shown = True
